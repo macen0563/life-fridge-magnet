@@ -1,0 +1,8 @@
+interface:
+  display_name: "生活冰箱贴"
+  short_description: "将照片制作成带珐琅冰箱贴的极简纪念海报"
+  default_prompt: "Use $life-fridge-magnet to turn my photo into a split-layout enamel fridge-magnet poster."
+
+policy:
+  allow_implicit_invocation: true
+
