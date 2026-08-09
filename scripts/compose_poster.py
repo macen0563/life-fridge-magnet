@@ -28,6 +28,40 @@ def parse_color(value: str) -> tuple[int, int, int]:
         raise argparse.ArgumentTypeError("invalid hex background color") from exc
 
 
+def parse_palette(value: str) -> list[tuple[int, int, int]]:
+    colors = [parse_color(part) for part in value.split(",") if part.strip()]
+    if not 2 <= len(colors) <= 6:
+        raise argparse.ArgumentTypeError("palette must contain 2-6 comma-separated hex colors")
+    return colors
+
+
+def badge_palette(badge: Image.Image, count: int = 4) -> list[tuple[int, int, int]]:
+    """Extract a compact enamel palette from visible badge pixels."""
+    rgba = badge.convert("RGBA")
+    rgba.thumbnail((256, 256), Image.Resampling.LANCZOS)
+    pixels = []
+    for y in range(rgba.height):
+        for x in range(rgba.width):
+            red, green, blue, alpha = rgba.getpixel((x, y))
+            if alpha > 220:
+                pixels.append((red, green, blue))
+    if not pixels:
+        return [(205, 157, 63), (44, 42, 38), (114, 135, 78), (104, 158, 174)]
+    sample = Image.new("RGB", (len(pixels), 1))
+    sample.putdata(pixels)
+    quantized = sample.quantize(colors=max(8, count * 2), method=Image.Quantize.MEDIANCUT)
+    palette = quantized.getpalette()
+    ranked = sorted(quantized.getcolors() or [], reverse=True)
+    colors = []
+    for _, index in ranked:
+        color = tuple(palette[index * 3:index * 3 + 3])
+        if not any(sum((a - b) ** 2 for a, b in zip(color, old)) < 1800 for old in colors):
+            colors.append(color)
+        if len(colors) == count:
+            break
+    return colors or [(205, 157, 63)]
+
+
 def cover_crop(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     target_w, target_h = size
     scale = max(target_w / image.width, target_h / image.height)
@@ -92,14 +126,33 @@ def tracked_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFon
     return sum(widths) + max(0, len(text) - 1) * tracking
 
 
+def centered_tracked_text(draw: ImageDraw.ImageDraw, text: str, field: tuple[int, int, int, int],
+                          y: int, font: ImageFont.ImageFont, fill: tuple[int, int, int],
+                          tracking: int) -> None:
+    field_x, _, field_w, _ = field
+    width = tracked_width(draw, text, font, tracking)
+    tracked_text(draw, (field_x + (field_w - width) // 2, y), text, font, fill, tracking)
+
+
+def contrast_ink(background: tuple[int, int, int]) -> tuple[int, int, int]:
+    luminance = 0.2126 * background[0] + 0.7152 * background[1] + 0.0722 * background[2]
+    return (42, 38, 32) if luminance >= 150 else (248, 245, 235)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--photo", required=True)
     parser.add_argument("--badge", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--place", required=True)
-    parser.add_argument("--subject", required=True)
+    parser.add_argument("--place", default="", help="legacy location field; used when --address is absent")
+    parser.add_argument("--subject", default="", help="optional factual subject wording")
     parser.add_argument("--date", required=True)
+    parser.add_argument("--address", default="")
+    parser.add_argument("--aperture", default="")
+    parser.add_argument("--iso", default="")
+    parser.add_argument("--shutter", default="")
+    parser.add_argument("--palette", type=parse_palette, default=None,
+                        help="2-6 comma-separated hex colors; defaults to badge-derived colors")
     parser.add_argument("--background", type=parse_color, required=True)
     parser.add_argument("--size", type=parse_size, default=None)
     parser.add_argument(
@@ -164,18 +217,41 @@ def main() -> None:
     canvas = Image.alpha_composite(canvas.convert("RGBA"), shadow)
     canvas.alpha_composite(badge, (badge_x, badge_y))
 
-    line = f"{args.place} | {args.subject} | {args.date}".upper()
     draw = ImageDraw.Draw(canvas)
-    font = choose_font(max(15, round(height * 0.018)))
-    tracking = max(1, round(width * 0.0013))
-    text_w = tracked_width(draw, line, font, tracking)
-    max_w = round(info_w * 0.82)
-    while text_w > max_w and getattr(font, "size", 12) > 11:
+    font = choose_font(max(13, round(min(width, height) * 0.015)))
+    tracking = max(1, round(min(width, height) * 0.0015))
+    ink = contrast_ink(args.background)
+    address = args.address or args.place
+    line_one = f"DATE  {args.date}     ADDRESS  {address}".upper().rstrip()
+    line_two = (
+        f"APERTURE  {args.aperture}     ISO  {args.iso}     SHUTTER  {args.shutter}"
+    ).upper().rstrip()
+    if args.subject:
+        line_one = f"{line_one}     SUBJECT  {args.subject.upper()}"
+
+    max_w = round(info_w * 0.86)
+    while max(tracked_width(draw, line_one, font, tracking),
+              tracked_width(draw, line_two, font, tracking)) > max_w and getattr(font, "size", 12) > 10:
         font = choose_font(font.size - 1)
-        text_w = tracked_width(draw, line, font, tracking)
-    text_x = max(info_x + round(info_w * 0.06), info_x + (info_w - text_w) // 2)
-    text_y = info_y + round(info_h * 0.72)
-    tracked_text(draw, (text_x, text_y), line, font, (245, 243, 234), tracking)
+
+    centered_tracked_text(draw, line_one, info_field, info_y + round(info_h * 0.66), font, ink, tracking)
+    centered_tracked_text(draw, line_two, info_field, info_y + round(info_h * 0.73), font, ink, tracking)
+
+    colors = args.palette or badge_palette(Image.open(args.badge))
+    swatch_w = round(info_w * 0.11)
+    swatch_h = max(12, round(info_h * 0.018))
+    gap = round(info_w * 0.022)
+    total_w = len(colors) * swatch_w + (len(colors) - 1) * gap
+    swatch_x = info_x + (info_w - total_w) // 2
+    swatch_y = info_y + round(info_h * 0.84)
+    radius = max(2, swatch_h // 4)
+    for color in colors:
+        draw.rounded_rectangle(
+            (swatch_x, swatch_y, swatch_x + swatch_w, swatch_y + swatch_h),
+            radius=radius,
+            fill=color,
+        )
+        swatch_x += swatch_w + gap
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
